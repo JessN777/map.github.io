@@ -1,25 +1,24 @@
 import type { SafetyHotspot } from '../routing/types'
-import {
-  INCIDENT_HOTSPOT_RADIUS_METERS,
-  labelForIncidentType,
-  type Incident,
-} from './incidents'
+import { clusterIncidents } from './incidentClusters'
+import type { Incident } from './incidents'
 
 /**
- * Static placeholder hotspots (crime clusters, lighting gaps, etc.).
- * Incident reports are stored separately and can be converted via
- * `incidentsToHotspots` when routing starts using safety data.
+ * Static placeholder hotspots (unused — reports drive routing now).
  */
 export const SAFETY_HOTSPOTS: SafetyHotspot[] = []
 
-/** Convert local incident reports into router-ready hotspot records. */
+/**
+ * Convert incident reports into tight, road-level hotspots for routing.
+ * Nearby reports are clustered so repeated reports raise local penalty
+ * without expanding across the neighborhood.
+ */
 export function incidentsToHotspots(incidents: Incident[]): SafetyHotspot[] {
-  return incidents.map((incident) => ({
-    id: incident.id,
-    lat: incident.latitude,
-    lng: incident.longitude,
-    weight: Math.min(Math.max(incident.severity / 5, 0), 1),
-    radiusMeters: INCIDENT_HOTSPOT_RADIUS_METERS,
-    label: labelForIncidentType(incident.type),
+  return clusterIncidents(incidents).map((cluster) => ({
+    id: cluster.id,
+    lat: cluster.latitude,
+    lng: cluster.longitude,
+    weight: cluster.weight,
+    radiusMeters: cluster.radiusMeters,
+    label: cluster.locationLabel,
   }))
 }

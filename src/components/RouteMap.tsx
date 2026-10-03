@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import {
   Circle,
   MapContainer,
@@ -7,17 +7,15 @@ import {
   Polyline,
   TileLayer,
   useMap,
+  useMapEvents,
 } from 'react-leaflet'
 import L from 'leaflet'
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
 import markerIcon from 'leaflet/dist/images/marker-icon.png'
 import markerShadow from 'leaflet/dist/images/marker-shadow.png'
 import { BERKELEY_CENTER } from '../data/berkeleyPlaces'
-import {
-  INCIDENT_HOTSPOT_RADIUS_METERS,
-  labelForIncidentType,
-  type Incident,
-} from '../data/incidents'
+import { clusterIncidents, type IncidentCluster } from '../data/incidentClusters'
+import { formatApproxReportTime, type Incident } from '../data/incidents'
 import type { LatLng } from '../routing/types'
 
 // Fix default marker icons when bundling with Vite
@@ -46,43 +44,141 @@ const endIcon = L.divIcon({
   iconAnchor: [9, 9],
 })
 
-const incidentIcon = L.divIcon({
-  className: 'sw-marker sw-marker--incident',
+const divergeIcon = L.divIcon({
+  className: 'sw-marker sw-marker--diverge',
   html: '<span></span>',
-  iconSize: [20, 20],
-  iconAnchor: [10, 10],
+  iconSize: [14, 14],
+  iconAnchor: [7, 7],
 })
+
+function incidentPinIcon(reportCount: number) {
+  const size = reportCount >= 3 ? 22 : reportCount >= 2 ? 18 : 14
+  return L.divIcon({
+    className: `sw-incident-pin sw-incident-pin--n${Math.min(reportCount, 4)}`,
+    html:
+      reportCount > 1
+        ? `<span class="sw-incident-pin__dot"></span><span class="sw-incident-pin__count">${reportCount}</span>`
+        : '<span class="sw-incident-pin__dot"></span>',
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+    popupAnchor: [0, -size / 2],
+  })
+}
 
 type RouteMapProps = {
   start: LatLng | null
   end: LatLng | null
-  route: LatLng[]
+  safestRoute: LatLng[]
+  shortestRoute: LatLng[]
+  showShortestComparison: boolean
   incidents: Incident[]
   focusIncidentId?: string | null
+  /** Privacy-blurred shared stretch with a matched walker (no exact peer pins). */
+  walkOverlapRoute?: LatLng[]
+  /** Coarse approximate peer route (not live GPS). */
+  walkPeerRoute?: LatLng[]
+  walkApproxAreaCenter?: LatLng | null
+  /** Approximate point where shared walk ends / routes diverge. */
+  walkDivergePoint?: LatLng | null
 }
 
-function FitBounds({
+function routeFingerprint(points: LatLng[]): string {
+  if (!points.length) return 'empty'
+  const mid = points[Math.floor(points.length / 2)]
+  const first = points[0]
+  const last = points[points.length - 1]
+  return [
+    points.length,
+    first.lat.toFixed(5),
+    first.lng.toFixed(5),
+    mid.lat.toFixed(5),
+    mid.lng.toFixed(5),
+    last.lat.toFixed(5),
+    last.lng.toFixed(5),
+  ].join('|')
+}
+
+/**
+ * Fit the map to routes once when they change, then get out of the way.
+ */
+function MapViewportController({
   start,
   end,
-  route,
-  focusIncident,
+  safestRoute,
+  shortestRoute,
+  showShortestComparison,
+  walkOverlapRoute,
+  focusPoint,
 }: {
   start: LatLng | null
   end: LatLng | null
-  route: LatLng[]
-  focusIncident: Incident | null
+  safestRoute: LatLng[]
+  shortestRoute: LatLng[]
+  showShortestComparison: boolean
+  walkOverlapRoute: LatLng[]
+  focusPoint: LatLng | null
 }) {
   const map = useMap()
+  const userMovedRef = useRef(false)
+  const lastFitKeyRef = useRef('')
+  const lastFocusKeyRef = useRef<string | null>(null)
+
+  useMapEvents({
+    dragstart: () => {
+      userMovedRef.current = true
+    },
+    zoomstart: () => {
+      if (lastFitKeyRef.current) userMovedRef.current = true
+    },
+  })
 
   useEffect(() => {
-    if (focusIncident) {
-      map.flyTo([focusIncident.latitude, focusIncident.longitude], 16, {
-        duration: 0.75,
-      })
+    map.dragging.enable()
+    map.scrollWheelZoom.enable()
+    map.doubleClickZoom.enable()
+    map.touchZoom.enable()
+    map.boxZoom.enable()
+    map.keyboard.enable()
+  }, [map])
+
+  useEffect(() => {
+    if (focusPoint) {
+      const focusKey = `${focusPoint.lat.toFixed(5)},${focusPoint.lng.toFixed(5)}`
+      if (lastFocusKeyRef.current !== focusKey) {
+        lastFocusKeyRef.current = focusKey
+        userMovedRef.current = false
+        map.flyTo([focusPoint.lat, focusPoint.lng], 17, {
+          duration: 0.65,
+        })
+      }
       return
     }
 
-    const points: LatLng[] = [...route]
+    const fitKey = [
+      routeFingerprint(safestRoute),
+      showShortestComparison ? routeFingerprint(shortestRoute) : 'no-short',
+      routeFingerprint(walkOverlapRoute),
+      start ? `${start.lat.toFixed(5)},${start.lng.toFixed(5)}` : 'no-start',
+      end ? `${end.lat.toFixed(5)},${end.lng.toFixed(5)}` : 'no-end',
+    ].join('::')
+
+    if (fitKey === lastFitKeyRef.current) return
+
+    const saferChanged =
+      !lastFitKeyRef.current ||
+      !lastFitKeyRef.current.startsWith(routeFingerprint(safestRoute))
+
+    if (userMovedRef.current && !saferChanged) {
+      lastFitKeyRef.current = fitKey
+      return
+    }
+
+    lastFitKeyRef.current = fitKey
+    userMovedRef.current = false
+
+    const points: LatLng[] = [...safestRoute]
+    if (showShortestComparison) points.push(...shortestRoute)
+    if (walkOverlapRoute.length) points.push(...walkOverlapRoute)
     if (start) points.push(start)
     if (end) points.push(end)
 
@@ -95,33 +191,62 @@ function FitBounds({
     if (points.length === 1) {
       map.setView([points[0].lat, points[0].lng], 15)
     }
-  }, [map, start, end, route, focusIncident])
+  }, [
+    map,
+    start,
+    end,
+    safestRoute,
+    shortestRoute,
+    showShortestComparison,
+    walkOverlapRoute,
+    focusPoint,
+  ])
 
   return null
 }
 
-function hotspotStyle(severity: number) {
-  const intensity = Math.min(Math.max(severity, 1), 5) / 5
-  return {
-    color: '#b42318',
-    weight: 2,
-    dashArray: '6 6',
-    fillColor: '#e11d48',
-    fillOpacity: 0.14 + intensity * 0.18,
-    opacity: 0.85,
-    className: 'safety-hotspot',
-  }
+function HotspotInfoCard({ cluster }: { cluster: IncidentCluster }) {
+  return (
+    <div className="incident-card">
+      <strong className="incident-card__type">{cluster.primaryTypeLabel}</strong>
+      <span className="incident-card__location">{cluster.locationLabel}</span>
+      <p className="incident-card__desc">{cluster.description}</p>
+      <span className="incident-card__time">
+        {formatApproxReportTime(cluster.latestTimestamp)}
+      </span>
+      <span className="incident-card__count">
+        {cluster.reportCount} report{cluster.reportCount === 1 ? '' : 's'} nearby
+      </span>
+      {cluster.incidents.some((incident) => incident.isDemo) && (
+        <span className="incident-card__demo">
+          Fictional demo report — not real crime data
+        </span>
+      )}
+    </div>
+  )
 }
 
 export function RouteMap({
   start,
   end,
-  route,
+  safestRoute,
+  shortestRoute,
+  showShortestComparison,
   incidents,
   focusIncidentId = null,
+  walkOverlapRoute = [],
+  walkPeerRoute = [],
+  walkApproxAreaCenter = null,
+  walkDivergePoint = null,
 }: RouteMapProps) {
-  const focusIncident =
-    incidents.find((incident) => incident.id === focusIncidentId) ?? null
+  const clusters = useMemo(() => clusterIncidents(incidents), [incidents])
+
+  const focusPoint = useMemo(() => {
+    if (!focusIncidentId) return null
+    const incident = incidents.find((entry) => entry.id === focusIncidentId)
+    if (!incident) return null
+    return { lat: incident.latitude, lng: incident.longitude }
+  }, [focusIncidentId, incidents])
 
   return (
     <MapContainer
@@ -129,60 +254,209 @@ export function RouteMap({
       zoom={14}
       className="route-map"
       scrollWheelZoom
+      dragging
+      doubleClickZoom
+      touchZoom
+      boxZoom
+      keyboard
+      zoomControl
+      inertia
+      worldCopyJump={false}
     >
       <TileLayer
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
-      <FitBounds
+      <MapViewportController
         start={start}
         end={end}
-        route={route}
-        focusIncident={focusIncident}
+        safestRoute={safestRoute}
+        shortestRoute={shortestRoute}
+        showShortestComparison={showShortestComparison}
+        walkOverlapRoute={walkOverlapRoute}
+        focusPoint={focusPoint}
       />
 
-      {incidents.map((incident) => (
+      {clusters.map((cluster) => (
         <Circle
-          key={`hotspot-${incident.id}`}
-          center={[incident.latitude, incident.longitude]}
-          radius={INCIDENT_HOTSPOT_RADIUS_METERS}
-          pathOptions={hotspotStyle(incident.severity)}
-        />
+          key={`halo-${cluster.id}`}
+          center={[cluster.latitude, cluster.longitude]}
+          radius={cluster.visualRadiusMeters}
+          pathOptions={{
+            color: '#be123c',
+            weight: 2,
+            dashArray: '4 6',
+            fillColor: '#e11d48',
+            fillOpacity: 0.16 + Math.min(cluster.maxSeverity, 5) * 0.03,
+            opacity: 0.85,
+            className: 'safety-hotspot',
+            interactive: true,
+          }}
+        >
+          <Popup className="incident-popup" maxWidth={220} minWidth={180}>
+            <HotspotInfoCard cluster={cluster} />
+          </Popup>
+        </Circle>
       ))}
 
-      {route.length > 1 && (
+      {clusters.map((cluster) =>
+        cluster.roadSegment.length >= 2 ? (
+          <Polyline
+            key={`road-${cluster.id}`}
+            positions={cluster.roadSegment.map(
+              (p) => [p.lat, p.lng] as [number, number],
+            )}
+            pathOptions={{
+              color: '#9f1239',
+              weight: cluster.reportCount >= 3 ? 6 : 4,
+              opacity: 0.55,
+              lineCap: 'round',
+              className: 'incident-road-tick',
+              interactive: false,
+            }}
+          />
+        ) : null,
+      )}
+
+      {showShortestComparison && shortestRoute.length > 1 && (
         <Polyline
-          positions={route.map((p) => [p.lat, p.lng] as [number, number])}
+          positions={shortestRoute.map(
+            (p) => [p.lat, p.lng] as [number, number],
+          )}
           pathOptions={{
-            color: '#003262',
-            weight: 6,
-            opacity: 0.9,
+            color: '#b42318',
+            weight: 5,
+            opacity: 0.55,
+            dashArray: '10 10',
             lineJoin: 'round',
             lineCap: 'round',
+            interactive: false,
           }}
         />
       )}
 
-      {start && (
-        <Marker position={[start.lat, start.lng]} icon={startIcon} />
+      {safestRoute.length > 1 && (
+        <Polyline
+          positions={safestRoute.map((p) => [p.lat, p.lng] as [number, number])}
+          pathOptions={{
+            color: '#0f6b3d',
+            weight: 6,
+            opacity: 0.92,
+            lineJoin: 'round',
+            lineCap: 'round',
+            interactive: false,
+          }}
+        />
       )}
-      {end && <Marker position={[end.lat, end.lng]} icon={endIcon} />}
 
-      {incidents.map((incident) => (
+      {walkPeerRoute.length > 1 && (
+        <Polyline
+          positions={walkPeerRoute.map(
+            (p) => [p.lat, p.lng] as [number, number],
+          )}
+          pathOptions={{
+            color: '#64748b',
+            weight: 4,
+            opacity: 0.45,
+            dashArray: '6 8',
+            lineJoin: 'round',
+            lineCap: 'round',
+            interactive: false,
+          }}
+        />
+      )}
+
+      {walkOverlapRoute.length > 1 && (
+        <Polyline
+          positions={walkOverlapRoute.map(
+            (p) => [p.lat, p.lng] as [number, number],
+          )}
+          pathOptions={{
+            color: '#0e7490',
+            weight: 12,
+            opacity: 0.35,
+            lineJoin: 'round',
+            lineCap: 'round',
+            className: 'walk-overlap-corridor',
+            interactive: false,
+          }}
+        />
+      )}
+
+      {walkOverlapRoute.length > 1 && (
+        <Polyline
+          positions={walkOverlapRoute.map(
+            (p) => [p.lat, p.lng] as [number, number],
+          )}
+          pathOptions={{
+            color: '#0891b2',
+            weight: 5,
+            opacity: 0.9,
+            dashArray: '2 10',
+            lineJoin: 'round',
+            lineCap: 'round',
+            interactive: false,
+          }}
+        />
+      )}
+
+      {walkApproxAreaCenter && (
+        <Circle
+          center={[walkApproxAreaCenter.lat, walkApproxAreaCenter.lng]}
+          radius={180}
+          pathOptions={{
+            color: '#0e7490',
+            weight: 1,
+            dashArray: '4 6',
+            fillColor: '#22d3ee',
+            fillOpacity: 0.12,
+            className: 'walk-approx-area',
+            interactive: false,
+          }}
+        />
+      )}
+
+      {walkDivergePoint && (
         <Marker
-          key={`marker-${incident.id}`}
-          position={[incident.latitude, incident.longitude]}
-          icon={incidentIcon}
+          position={[walkDivergePoint.lat, walkDivergePoint.lng]}
+          icon={divergeIcon}
+          draggable={false}
         >
-          <Popup>
-            <strong>{labelForIncidentType(incident.type)}</strong>
-            <br />
-            {incident.description}
-            <br />
-            <small>
-              Severity {incident.severity}/5 ·{' '}
-              {new Date(incident.timestamp).toLocaleString()}
-            </small>
+          <Popup className="incident-popup" maxWidth={180}>
+            <div className="incident-card">
+              <strong className="incident-card__type">Routes separate</strong>
+              <span className="incident-card__location">
+                Approximate point where the shared stretch ends
+              </span>
+            </div>
+          </Popup>
+        </Marker>
+      )}
+
+      {start && (
+        <Marker
+          position={[start.lat, start.lng]}
+          icon={startIcon}
+          draggable={false}
+        />
+      )}
+      {end && (
+        <Marker
+          position={[end.lat, end.lng]}
+          icon={endIcon}
+          draggable={false}
+        />
+      )}
+
+      {clusters.map((cluster) => (
+        <Marker
+          key={`pin-${cluster.id}`}
+          position={[cluster.latitude, cluster.longitude]}
+          icon={incidentPinIcon(cluster.reportCount)}
+          draggable={false}
+        >
+          <Popup className="incident-popup" maxWidth={220} minWidth={180}>
+            <HotspotInfoCard cluster={cluster} />
           </Popup>
         </Marker>
       ))}

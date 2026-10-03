@@ -24,13 +24,13 @@ export function ReportIncidentForm({
   submitting,
   error,
 }: ReportIncidentFormProps) {
-  const [type, setType] = useState<IncidentType>('unsafe_area')
+  const [type, setType] = useState<IncidentType>('catcalling_harassment')
   const [description, setDescription] = useState('')
   const [location, setLocation] = useState(DEMO_REPORT_LOCATION)
 
   useEffect(() => {
     if (!open) return
-    setType('unsafe_area')
+    setType('catcalling_harassment')
     setDescription('')
     setLocation(DEMO_REPORT_LOCATION)
   }, [open])
@@ -64,8 +64,8 @@ export function ReportIncidentForm({
         </header>
 
         <p className="report-modal__subtitle">
-          Share what happened so other students can see nearby safety hotspots.
-          Demo default: Bancroft Way.
+          Share a precise street location so others see a small marker on that
+          road segment. Demo reports on the map are fictional.
         </p>
 
         <form
