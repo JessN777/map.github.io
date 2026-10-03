@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SafeWalk Berkeley (MVP)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html,body{margin:0;height:100%;font-family:system-ui,sans-serif}
+  #map{position:absolute;inset:0}
+  #panel{position:absolute;z-index:1000;top:10px;left:10px;width:300px;background:#fff;border-radius:10px;
+    box-shadow:0 2px 12px rgba(0,0,0,.25);padding:12px;font-size:14px}
+  h1{font-size:16px;margin:0 0 8px}
+  button{padding:6px 10px;border:1px solid #888;border-radius:6px;background:#f5f5f5;cursor:pointer;margin:2px 2px 2px 0}
+  button.active{background:#1a73e8;color:#fff;border-color:#1a73e8}
+  label{display:block;margin-top:8px}
+  input[type=range]{width:100%}
+  #status{margin-top:8px;color:#555;font-size:12px}
+  .res{margin-top:8px;padding:6px;border-radius:6px;font-size:13px}
+  .safe{background:#e6f4ea;border-left:4px solid #1e8e3e}
+  .fast{background:#fce8e6;border-left:4px solid #d93025}
+  small{color:#666}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>SafeWalk Berkeley <small>MVP</small></h1>
+  <div>
+    <button id="btnStart" class="active">Set start</button>
+    <button id="btnEnd">Set end</button>
+    <button id="btnReport">Report unsafe spot</button>
+  </div>
+  <label>Safety vs speed: <b id="wv">3</b>
+    <input id="w" type="range" min="0" max="6" step="0.5" value="3">
+    <small>0 = fastest, higher = detour more for safety</small>
+  </label>
+  <label><input type="checkbox" id="showCrime" checked> Show crime hotspots</label>
+  <div id="results"></div>
+  <div id="status">Loading Berkeley walking network…</div>
+  <small>Click the map to place points. Crime hotspots are placeholders—replace with real data in CRIME_HOTSPOTS.</small>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ---------- Config ----------
+const BBOX = [37.845, -122.32, 37.905, -122.235]; // S,W,N,E  (Berkeley)
+const WALK_KMH = 5;
+
+// PLACEHOLDER crime hotspots: [lat, lng, weight 0-1]. Replace with Berkeley PD / city open data.
+const CRIME_HOTSPOTS = [
+  [37.8665, -122.2585, 0.8], // Telegraph/Durant area (illustrative)
+  [37.8700, -122.2680, 0.7], // Downtown BART (illustrative)
+  [37.8530, -122.2700, 0.7], // Ashby BART (illustrative)
+  [37.8680, -122.2565, 0.6], // Southside (illustrative)
+  [37.8780, -122.2830, 0.4]  // West Berkeley (illustrative)
+];
+const CRIME_RADIUS = 250; // meters
+const REPORT_RADIUS = 80; // meters
+
+// ---------- State ----------
+const map = L.map('map').setView([37.8715, -122.2730], 14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
+map.setMaxBounds([[BBOX[0]-0.02,BBOX[1]-0.02],[BBOX[2]+0.02,BBOX[3]+0.02]]);
+
+let mode = 'start', start = null, end = null, mStart, mEnd, routeLayers = [];
+let reports = [];
+try { reports = JSON.parse(localStorage.getItem('safewalk_reports') || '[]'); } catch(e){}
+const reportLayer = L.layerGroup().addTo(map);
+const crimeLayer = L.layerGroup().addTo(map);
+
+// ---------- Geometry ----------
+function hav(a, b) {
+  const R = 6371000, rad = Math.PI/180;
+  const dLat = (b[0]-a[0])*rad, dLng = (b[1]-a[1])*rad;
+  const s = Math.sin(dLat/2)**2 + Math.cos(a[0]*rad)*Math.cos(b[0]*rad)*Math.sin(dLng/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+function crimeRisk(p) {
+  let r = 0;
+  for (const [la, ln, w] of CRIME_HOTSPOTS) {
+    const d = hav(p, [la, ln]);
+    if (d < CRIME_RADIUS*2) r += w * Math.exp(-(d*d)/(2*(CRIME_RADIUS/2)**2));
+  }
+  return Math.min(r, 1.5);
+}
+function reportRisk(p) {
+  let r = 0;
+  for (const rp of reports) {
+    const d = hav(p, [rp.lat, rp.lng]);
+    if (d < REPORT_RADIUS*2) r += Math.exp(-(d*d)/(2*(REPORT_RADIUS/2)**2));
+  }
+  return Math.min(r, 2);
+}
+
+// ---------- Graph ----------
+const nodes = new Map();   // id -> [lat,lng]
+const adj = new Map();     // id -> [{to, len, pen}]
+const ROAD_PEN = {footway:0.3, path:0.5, steps:0.3, service:0.4, track:0.6, cycleway:0.2};
+
+function addEdge(a, b, len, pen) {
+  if (!adj.has(a)) adj.set(a, []);
+  adj.get(a).push({to: b, len, pen});
+}
+
+function buildGraph(elements) {
+  for (const w of elements) {
+    if (w.type !== 'way' || !w.geometry) continue;
+    const t = w.tags || {};
+    let pen = ROAD_PEN[t.highway] || 0;
+    pen += t.lit === 'yes' ? 0 : t.lit === 'no' ? 1 : 0.4;   // lighting penalty
+    for (let i = 0; i < w.nodes.length - 1; i++) {
+      const a = w.nodes[i], b = w.nodes[i+1];
+      const pa = [w.geometry[i].lat, w.geometry[i].lon];
+      const pb = [w.geometry[i+1].lat, w.geometry[i+1].lon];
+      nodes.set(a, pa); nodes.set(b, pb);
+      const len = hav(pa, pb);
+      const mid = [(pa[0]+pb[0])/2, (pa[1]+pb[1])/2];
+      const segPen = pen + 2*crimeRisk(mid);
+      addEdge(a, b, len, {base: segPen, mid});
+      addEdge(b, a, len, {base: segPen, mid});
+    }
+  }
+}
+function edgeCost(e, weight) {
+  const rep = reportRisk(e.pen.mid) * 2;
+  return e.len * (1 + weight * (e.pen.base + rep));
+}
+function nearestNode(p) {
+  let best = null, bd = Infinity;
+  for (const [id, c] of nodes) {
+    if (!adj.has(id)) continue;
+    const d = (c[0]-p[0])**2 + (c[1]-p[1])**2;
+    if (d < bd) { bd = d; best = id; }
+  }
+  return best;
+}
+
+// Dijkstra with binary heap
+function dijkstra(src, dst, weight) {
+  const dist = new Map([[src, 0]]), prev = new Map();
+  const heap = [[0, src]];
+  const push = x => { heap.push(x); let i = heap.length-1;
+    while (i > 0) { const p = (i-1)>>1; if (heap[p][0] <= heap[i][0]) break; [heap[p],heap[i]]=[heap[i],heap[p]]; i = p; } };
+  const pop = () => { const top = heap[0], last = heap.pop();
+    if (heap.length) { heap[0] = last; let i = 0;
+      for (;;) { let l = 2*i+1, r = l+1, m = i;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break; [heap[m],heap[i]]=[heap[i],heap[m]]; i = m; } }
+    return top; };
+  while (heap.length) {
+    const [d, u] = pop();
+    if (u === dst) break;
+    if (d > (dist.get(u) ?? Infinity)) continue;
+    for (const e of adj.get(u) || []) {
+      const nd = d + edgeCost(e, weight);
+      if (nd < (dist.get(e.to) ?? Infinity)) { dist.set(e.to, nd); prev.set(e.to, [u, e]); push([nd, e.to]); }
+    }
+  }
+  if (!prev.has(dst) && src !== dst) return null;
+  const path = [nodes.get(dst)]; let len = 0, risk = 0, cur = dst;
+  while (cur !== src) { const [p, e] = prev.get(cur); len += e.len; risk += e.len * (e.pen.base + reportRisk(e.pen.mid)*2);
+    cur = p; path.push(nodes.get(cur)); }
+  return {path: path.reverse(), len, risk: len ? risk/len : 0};
+}
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+function setMode(m) {
+  mode = m;
+  $('btnStart').classList.toggle('active', m==='start');
+  $('btnEnd').classList.toggle('active', m==='end');
+  $('btnReport').classList.toggle('active', m==='report');
+}
+$('btnStart').onclick = () => setMode('start');
+$('btnEnd').onclick = () => setMode('end');
+$('btnReport').onclick = () => setMode('report');
+$('w').oninput = () => { $('wv').textContent = $('w').value; route(); };
+$('showCrime').onchange = drawCrime;
+
+function drawCrime() {
+  crimeLayer.clearLayers();
+  if (!$('showCrime').checked) return;
+  CRIME_HOTSPOTS.forEach(([la, ln, w]) =>
+    L.circle([la, ln], {radius: CRIME_RADIUS, color: '#d93025', fillOpacity: .12*w+.05, weight: 1}).addTo(crimeLayer));
+}
+function drawReports() {
+  reportLayer.clearLayers();
+  reports.forEach((r, i) => {
+    L.circleMarker([r.lat, r.lng], {radius: 7, color: '#e37400', fillOpacity: .8})
+      .bindPopup(`Reported unsafe<br><button onclick="removeReport(${i})">Remove</button>`).addTo(reportLayer);
+  });
+}
+window.removeReport = i => { reports.splice(i, 1); saveReports(); drawReports(); route(); };
+function saveReports() { try { localStorage.setItem('safewalk_reports', JSON.stringify(reports)); } catch(e){} }
+
+map.on('click', e => {
+  const p = [e.latlng.lat, e.latlng.lng];
+  if (mode === 'report') {
+    reports.push({lat: p[0], lng: p[1], t: Date.now()});
+    saveReports(); drawReports(); route(); return;
+  }
+  if (mode === 'start') { start = p; if (mStart) map.removeLayer(mStart);
+    mStart = L.marker(p).addTo(map).bindTooltip('Start'); setMode('end'); }
+  else { end = p; if (mEnd) map.removeLayer(mEnd);
+    mEnd = L.marker(p).addTo(map).bindTooltip('End'); }
+  route();
+});
+
+function route() {
+  routeLayers.forEach(l => map.removeLayer(l)); routeLayers = [];
+  $('results').innerHTML = '';
+  if (!start || !end || !nodes.size) return;
+  const s = nearestNode(start), d = nearestNode(end);
+  const weight = parseFloat($('w').value);
+  const fast = dijkstra(s, d, 0), safe = dijkstra(s, d, weight);
+  if (!fast || !safe) { $('results').textContent = 'No walking route found.'; return; }
+  const draw = (r, color, dash) => routeLayers.push(
+    L.polyline(r.path, {color, weight: 6, opacity: .85, dashArray: dash}).addTo(map));
+  draw(fast, '#d93025', '8 8'); draw(safe, '#1e8e3e');
+  map.fitBounds(L.latLngBounds(safe.path.concat(fast.path)), {padding: [40, 40]});
+  const fmt = r => `${(r.len/1000).toFixed(2)} km · ${Math.round(r.len/(WALK_KMH*1000/60))} min · risk ${r.risk.toFixed(2)}`;
+  $('results').innerHTML =
+    `<div class="res safe"><b>Safest</b><br>${fmt(safe)}</div>` +
+    `<div class="res fast"><b>Fastest</b><br>${fmt(fast)}</div>`;
+}
+
+// ---------- Load OSM data ----------
+async function load() {
+  const q = `[out:json][timeout:60];
+    way["highway"~"^(primary|secondary|tertiary|residential|unclassified|living_street|pedestrian|footway|path|steps|service|cycleway|track)$"]
+    ["foot"!="no"]["access"!="private"](${BBOX.join(',')});
+    out geom;`;
+  const servers = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  for (const url of servers) {
+    try {
+      const r = await fetch(url, {method: 'POST', body: 'data=' + encodeURIComponent(q)});
+      if (!r.ok) continue;
+      const j = await r.json();
+      buildGraph(j.elements);
+      $('status').textContent = `Ready: ${nodes.size.toLocaleString()} intersections loaded.`;
+      route(); return;
+    } catch (e) { console.warn(e); }
+  }
+  $('status').textContent = 'Failed to load map data. Refresh to retry.';
+}
+drawCrime(); drawReports(); load();
+</script>
+</body>
+</html>
